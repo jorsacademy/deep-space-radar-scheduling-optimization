@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 import random
@@ -8,6 +10,8 @@ import random
 import matplotlib.pyplot as plt
 import numpy as np
 from pulp import LpBinary, LpMaximize, LpProblem, LpStatus, LpVariable, PULP_CBC_CMD, lpSum, value
+
+from orbital_visibility import RadarLocation, SGP4VisibilityEngine
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,7 @@ class RadarSite:
     energy_budget_kwh: float
     idle_power_kw: float
     tracking_power_kw: float
+    elevation_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -33,11 +38,12 @@ class SpaceObject:
 
 
 class DeepSpaceRadarScheduler:
-    """Educational MILP model for deep-space radar scheduling.
+    """MILP radar scheduler with synthetic or TLE/SGP4 orbital visibility.
 
-    The orbital visibility model is deliberately synthetic. The optimization model,
-    however, consistently treats a decision variable as the *start* of a fixed-duration
-    observation and reserves every occupied slot.
+    When ``tle_file`` is provided, orbital positions are propagated with SGP4
+    through Skyfield and converted to topocentric elevation/range at each radar.
+    Without a TLE file the original deterministic synthetic demonstration mode is
+    retained for lightweight examples and structural tests.
     """
 
     def __init__(
@@ -48,6 +54,8 @@ class DeepSpaceRadarScheduler:
         min_observations: int = 3,
         min_separation_minutes: int = 60,
         observation_duration_minutes: int = 20,
+        tle_file: str | Path | None = None,
+        start_time_utc: datetime | None = None,
     ) -> None:
         if observation_duration_minutes % slot_minutes != 0:
             raise ValueError("observation_duration_minutes must be divisible by slot_minutes")
@@ -68,19 +76,51 @@ class DeepSpaceRadarScheduler:
         self.min_elevation_deg = 5.0
 
         self.radars = self._initialize_radars()
+        self.tle_file = Path(tle_file) if tle_file is not None else None
+        self.orbit_engine = SGP4VisibilityEngine.from_file(self.tle_file) if self.tle_file else None
+        self.start_time_utc = self._normalize_start_time(start_time_utc)
         self.objects = self._initialize_objects()
+
         self.visibility_matrix: np.ndarray | None = None
         self.quality_matrix: np.ndarray | None = None
+        self.elevation_matrix_deg: np.ndarray | None = None
+        self.range_matrix_km: np.ndarray | None = None
         self.solution: Dict | None = None
+
+    @property
+    def visibility_mode(self) -> str:
+        return "sgp4" if self.orbit_engine is not None else "synthetic"
+
+    def _normalize_start_time(self, start_time_utc: datetime | None) -> datetime | None:
+        if self.orbit_engine is None:
+            return None
+        if start_time_utc is None:
+            return self.orbit_engine.default_start_time_utc()
+        if start_time_utc.tzinfo is None:
+            return start_time_utc.replace(tzinfo=timezone.utc)
+        return start_time_utc.astimezone(timezone.utc)
 
     def _initialize_radars(self) -> List[RadarSite]:
         return [
-            RadarSite("Maui_Hawaii", (20.7, -156.3), 34.0, 2.0, 240.0, 2000.0, 50.0, 150.0),
-            RadarSite("Millstone_Hill", (42.6, -71.5), 26.0, 1.5, 360.0, 1600.0, 40.0, 120.0),
-            RadarSite("Goldstone_CA", (35.4, -116.9), 70.0, 0.4, 270.0, 1200.0, 30.0, 80.0),
+            RadarSite("Maui_Hawaii", (20.7, -156.3), 34.0, 2.0, 240.0, 2000.0, 50.0, 150.0, 3055.0),
+            RadarSite("Millstone_Hill", (42.6, -71.5), 26.0, 1.5, 360.0, 1600.0, 40.0, 120.0, 146.0),
+            RadarSite("Goldstone_CA", (35.4, -116.9), 70.0, 0.4, 270.0, 1200.0, 30.0, 80.0, 1000.0),
         ]
 
     def _initialize_objects(self) -> List[SpaceObject]:
+        if self.orbit_engine is not None:
+            return [
+                SpaceObject(
+                    object_id=i,
+                    name=record.name,
+                    rcs_m2=10.0,
+                    priority=1.0,
+                    object_type="tle_object",
+                    orbital_elements={},
+                )
+                for i, record in enumerate(self.orbit_engine.records)
+            ]
+
         objects: List[SpaceObject] = []
         for i in range(15):
             objects.append(
@@ -130,6 +170,24 @@ class DeepSpaceRadarScheduler:
         return objects
 
     def calculate_visibility_matrix(self) -> np.ndarray:
+        if self.orbit_engine is not None:
+            assert self.start_time_utc is not None
+            radar_locations = [
+                RadarLocation(r.name, r.location[0], r.location[1], r.elevation_m)
+                for r in self.radars
+            ]
+            visibility, elevation, range_km = self.orbit_engine.compute_geometry(
+                radars=radar_locations,
+                start_time_utc=self.start_time_utc,
+                slot_minutes=self.slot_minutes,
+                time_slots=self.time_slots,
+                min_elevation_deg=self.min_elevation_deg,
+            )
+            self.visibility_matrix = visibility
+            self.elevation_matrix_deg = elevation
+            self.range_matrix_km = range_km
+            return visibility
+
         n_r, n_o = len(self.radars), len(self.objects)
         visibility = np.zeros((n_r, n_o, self.time_slots), dtype=np.int8)
         mu = 3.986e14
@@ -169,9 +227,20 @@ class DeepSpaceRadarScheduler:
             antenna_gain = (np.pi * radar.dish_diameter_m / self.wavelength_m) ** 2
             for o, obj in enumerate(self.objects):
                 for t in np.flatnonzero(self.visibility_matrix[r, o]):
-                    base_range_km = obj.orbital_elements["semi_major_axis_km"] * 0.8
-                    range_km = base_range_km * (1 + 0.2 * np.sin(2 * np.pi * t / self.time_slots))
-                    range_m = range_km * 1000.0
+                    if self.orbit_engine is not None:
+                        assert self.range_matrix_km is not None
+                        assert self.elevation_matrix_deg is not None
+                        range_km = float(self.range_matrix_km[r, o, t])
+                        elevation = float(self.elevation_matrix_deg[r, o, t])
+                    else:
+                        base_range_km = obj.orbital_elements["semi_major_axis_km"] * 0.8
+                        range_km = base_range_km * (1 + 0.2 * np.sin(2 * np.pi * t / self.time_slots))
+                        elevation = max(
+                            self.min_elevation_deg,
+                            self.rng.uniform(5, 60) * np.sin(2 * np.pi * t / self.time_slots) ** 2,
+                        )
+
+                    range_m = max(range_km, 1.0) * 1000.0
                     snr_linear = (
                         radar.peak_power_mw
                         * 1e6
@@ -182,10 +251,6 @@ class DeepSpaceRadarScheduler:
                     if snr_linear <= 0:
                         continue
                     snr_db = 10 * np.log10(snr_linear)
-                    elevation = max(
-                        self.min_elevation_deg,
-                        self.rng.uniform(5, 60) * np.sin(2 * np.pi * t / self.time_slots) ** 2,
-                    )
                     if snr_db >= self.snr_threshold_db:
                         quality[r, o, t] = min(
                             100.0,
@@ -231,7 +296,7 @@ class DeepSpaceRadarScheduler:
         )
 
         for o in range(len(self.objects)):
-            obs = [var for (r2, o2, t2), var in x.items() if o2 == o]
+            obs = [var for (_r2, o2, _t2), var in x.items() if o2 == o]
             if not obs:
                 problem += z[o] == 0
                 continue
@@ -243,20 +308,17 @@ class DeepSpaceRadarScheduler:
             for tau in range(self.time_slots):
                 occupying = [
                     var
-                    for (r2, o2, t), var in x.items()
+                    for (r2, _o2, t), var in x.items()
                     if r2 == r and t <= tau < t + self.duration_slots
                 ]
                 if occupying:
                     problem += lpSum(occupying) <= 1
 
         for o in range(len(self.objects)):
-            object_starts = sorted(t for (r2, o2, t) in x if o2 == o)
-            if not object_starts:
-                continue
             for window_start in range(self.time_slots):
                 vars_in_window = [
                     var
-                    for (r2, o2, t), var in x.items()
+                    for (_r2, o2, t), var in x.items()
                     if o2 == o and window_start <= t < window_start + self.min_separation_slots
                 ]
                 if vars_in_window:
@@ -265,7 +327,7 @@ class DeepSpaceRadarScheduler:
         horizon_hours = self.time_slots * self.slot_minutes / 60.0
         obs_hours = self.duration_slots * self.slot_minutes / 60.0
         for r, radar in enumerate(self.radars):
-            starts_r = [var for (r2, o2, t), var in x.items() if r2 == r]
+            starts_r = [var for (r2, _o2, _t), var in x.items() if r2 == r]
             idle_energy = radar.idle_power_kw * horizon_hours
             incremental_tracking = max(radar.tracking_power_kw - radar.idle_power_kw, 0.0) * obs_hours
             problem += idle_energy + incremental_tracking * lpSum(starts_r) <= radar.energy_budget_kwh
@@ -280,6 +342,7 @@ class DeepSpaceRadarScheduler:
                     schedule[r].append(
                         {
                             "object_id": o,
+                            "object_name": self.objects[o].name,
                             "start_slot": t,
                             "start_minute_utc": t * self.slot_minutes,
                             "duration_minutes": self.duration_slots * self.slot_minutes,
@@ -320,6 +383,8 @@ class DeepSpaceRadarScheduler:
 
         return {
             "status": status,
+            "visibility_mode": self.visibility_mode,
+            "start_time_utc": self.start_time_utc.isoformat() if self.start_time_utc else None,
             "objective_value": float(objective_value or 0.0),
             "schedule": schedule,
             "radar_utilization": radar_utilization,
@@ -334,6 +399,8 @@ class DeepSpaceRadarScheduler:
         total_observations = sum(len(rows) for rows in self.solution["schedule"].values())
         return {
             "status": self.solution["status"],
+            "visibility_mode": self.solution["visibility_mode"],
+            "start_time_utc": self.solution["start_time_utc"],
             "total_observations": total_observations,
             "coverage_percentage": 100.0 * covered / len(self.objects),
             "average_utilization_percentage": 100.0 * float(np.mean(list(self.solution["radar_utilization"].values()))),
@@ -352,8 +419,8 @@ class DeepSpaceRadarScheduler:
                 ax.barh(r, duration_h, left=start_h, height=0.55)
         ax.set_yticks(range(len(self.radars)))
         ax.set_yticklabels([radar.name for radar in self.radars])
-        ax.set_xlabel("UTC hour")
-        ax.set_title("Deep-space radar observation schedule")
+        ax.set_xlabel("Hours from scheduling horizon start")
+        ax.set_title(f"Radar observation schedule ({self.visibility_mode})")
         ax.grid(True, alpha=0.25)
         fig.tight_layout()
         fig.savefig(output, dpi=180, bbox_inches="tight")
@@ -363,16 +430,37 @@ class DeepSpaceRadarScheduler:
         return output
 
 
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def main() -> None:
-    scheduler = DeepSpaceRadarScheduler()
+    parser = argparse.ArgumentParser(description="Deep-space radar scheduling optimization")
+    parser.add_argument("--tle-file", type=Path, help="TLE catalog; enables SGP4 visibility")
+    parser.add_argument("--start-utc", type=_parse_utc, help="Horizon start, e.g. 2026-08-29T00:00:00Z")
+    parser.add_argument("--horizon-hours", type=int, default=24)
+    parser.add_argument("--output", type=Path, default=Path("radar_schedule.png"))
+    args = parser.parse_args()
+
+    scheduler = DeepSpaceRadarScheduler(
+        tle_file=args.tle_file,
+        start_time_utc=args.start_utc,
+        horizon_hours=args.horizon_hours,
+    )
     scheduler.solve()
     summary = scheduler.analyze_results()
+    print(f"Visibility mode: {summary['visibility_mode']}")
+    if summary["start_time_utc"]:
+        print(f"Horizon start: {summary['start_time_utc']}")
     print(f"Status: {summary['status']}")
     print(f"Coverage: {summary['coverage_percentage']:.1f}%")
     print(f"Observations: {summary['total_observations']}")
     print(f"Average utilization: {summary['average_utilization_percentage']:.1f}%")
     print(f"Objective: {summary['objective_value']:.2f}")
-    scheduler.visualize_schedule()
+    scheduler.visualize_schedule(args.output)
 
 
 if __name__ == "__main__":
