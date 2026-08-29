@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
 CELESTRAK_SATCAT_URL = "https://celestrak.org/satcat/records.php"
 USER_AGENT = "deep-space-radar-scheduling-optimization/1.0"
+SUPPORTED_GP_FORMATS = {"tle": "TLE", "json": "JSON", "csv": "CSV"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,40 @@ def _http_get_text(base_url: str, params: dict[str, str | int], timeout: float =
         return response.read().decode("utf-8")
 
 
+def download_current_gp(
+    output: str | Path,
+    *,
+    gp_format: str = "json",
+    group: str | None = None,
+    catnr: int | None = None,
+    name: str | None = None,
+    timeout: float = 30.0,
+) -> Path:
+    """Download current CelesTrak GP elements as OMM JSON/CSV or legacy TLE."""
+    selectors = [("GROUP", group), ("CATNR", catnr), ("NAME", name)]
+    active = [(key, value) for key, value in selectors if value is not None]
+    if len(active) != 1:
+        raise ValueError("provide exactly one of group, catnr, or name")
+
+    normalized_format = gp_format.lower()
+    if normalized_format not in SUPPORTED_GP_FORMATS:
+        raise ValueError(f"gp_format must be one of {sorted(SUPPORTED_GP_FORMATS)}")
+
+    key, value = active[0]
+    text = _http_get_text(
+        CELESTRAK_GP_URL,
+        {key: value, "FORMAT": SUPPORTED_GP_FORMATS[normalized_format]},
+        timeout,
+    )
+    if not text.strip() or "No GP data found" in text:
+        raise RuntimeError("CelesTrak returned no GP data for the requested selector")
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    return output
+
+
 def download_current_tle(
     output: str | Path,
     *,
@@ -44,26 +79,15 @@ def download_current_tle(
     name: str | None = None,
     timeout: float = 30.0,
 ) -> Path:
-    """Download current GP data from CelesTrak in 3-line TLE format.
-
-    Exactly one selector must be provided. TLE is retained for compatibility with
-    the scheduler, but newly cataloged objects above the traditional 5-digit TLE
-    range should use CelesTrak OMM formats instead.
-    """
-    selectors = [("GROUP", group), ("CATNR", catnr), ("NAME", name)]
-    active = [(key, value) for key, value in selectors if value is not None]
-    if len(active) != 1:
-        raise ValueError("provide exactly one of group, catnr, or name")
-
-    key, value = active[0]
-    text = _http_get_text(CELESTRAK_GP_URL, {key: value, "FORMAT": "TLE"}, timeout)
-    if not text.strip() or "No GP data found" in text:
-        raise RuntimeError("CelesTrak returned no GP data for the requested selector")
-
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(text, encoding="utf-8")
-    return output
+    """Compatibility wrapper for legacy TLE downloads."""
+    return download_current_gp(
+        output,
+        gp_format="tle",
+        group=group,
+        catnr=catnr,
+        name=name,
+        timeout=timeout,
+    )
 
 
 def fetch_satcat_metadata(
