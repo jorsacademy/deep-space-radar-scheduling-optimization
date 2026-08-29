@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 from skyfield.api import EarthSatellite, load, wgs84
@@ -17,6 +19,14 @@ class TLERecord:
 
 
 @dataclass(frozen=True)
+class OrbitRecord:
+    name: str
+    catalog_id: int
+    satellite: EarthSatellite
+    source_format: str
+
+
+@dataclass(frozen=True)
 class RadarLocation:
     name: str
     latitude_deg: float
@@ -25,12 +35,7 @@ class RadarLocation:
 
 
 def load_tle_records(path: str | Path) -> list[TLERecord]:
-    """Load standard 2-line or 3-line TLE records from a text file.
-
-    Three-line records contain a name followed by line 1 and line 2. Two-line
-    records are accepted as well and receive a NORAD-derived fallback name.
-    Blank lines and comment lines beginning with ``#`` are ignored.
-    """
+    """Load standard 2-line or 3-line TLE records."""
     lines = [
         line.strip()
         for line in Path(path).read_text(encoding="utf-8").splitlines()
@@ -60,25 +65,99 @@ def load_tle_records(path: str | Path) -> list[TLERecord]:
     return records
 
 
-class SGP4VisibilityEngine:
-    """Topocentric visibility and range computation backed by Skyfield/SGP4."""
+def _catalog_id(fields: Mapping[str, object]) -> int:
+    value = fields.get("NORAD_CAT_ID")
+    if value is None:
+        raise ValueError("OMM record is missing NORAD_CAT_ID")
+    return int(str(value).strip())
 
-    def __init__(self, records: Sequence[TLERecord]) -> None:
+
+def _object_name(fields: Mapping[str, object], catalog_id: int) -> str:
+    name = str(fields.get("OBJECT_NAME") or "").strip()
+    return name or f"NORAD_{catalog_id}"
+
+
+def _load_omm_fields(path: Path) -> tuple[list[dict[str, object]], str]:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
+            raise ValueError("OMM JSON must contain an object or an array of objects")
+        return [dict(row) for row in payload], "omm-json"
+
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = [dict(row) for row in csv.DictReader(handle)]
+        if not rows:
+            raise ValueError("No OMM CSV records found")
+        return rows, "omm-csv"
+
+    raise ValueError(f"Unsupported OMM file extension: {path.suffix}")
+
+
+class SGP4VisibilityEngine:
+    """Topocentric visibility/range computation backed by Skyfield SGP4.
+
+    Input can be traditional TLE or modern OMM JSON/CSV. OMM is preferred for
+    current catalogs because it is not constrained by the TLE five-digit catalog
+    number field and can carry additional precision.
+    """
+
+    def __init__(self, records: Sequence[OrbitRecord]) -> None:
         if not records:
-            raise ValueError("At least one TLE record is required")
+            raise ValueError("At least one orbital record is required")
         self.records = list(records)
-        self.ts = load.timescale(builtin=True)
-        self.satellites = [
-            EarthSatellite(record.line1, record.line2, record.name, self.ts)
-            for record in self.records
-        ]
+        self.satellites = [record.satellite for record in self.records]
+        self.ts = self.satellites[0].ts
+
+    @classmethod
+    def from_tle_file(cls, path: str | Path) -> "SGP4VisibilityEngine":
+        ts = load.timescale(builtin=True)
+        records: list[OrbitRecord] = []
+        for tle in load_tle_records(path):
+            satellite = EarthSatellite(tle.line1, tle.line2, tle.name, ts)
+            records.append(
+                OrbitRecord(
+                    name=tle.name,
+                    catalog_id=int(satellite.model.satnum),
+                    satellite=satellite,
+                    source_format="tle",
+                )
+            )
+        return cls(records)
+
+    @classmethod
+    def from_omm_file(cls, path: str | Path) -> "SGP4VisibilityEngine":
+        path = Path(path)
+        fields_list, source_format = _load_omm_fields(path)
+        ts = load.timescale(builtin=True)
+        records: list[OrbitRecord] = []
+        for fields in fields_list:
+            catalog_id = _catalog_id(fields)
+            name = _object_name(fields, catalog_id)
+            satellite = EarthSatellite.from_omm(ts, fields)
+            satellite.name = name
+            records.append(OrbitRecord(name, catalog_id, satellite, source_format))
+        return cls(records)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "SGP4VisibilityEngine":
-        return cls(load_tle_records(path))
+        path = Path(path)
+        suffix = path.suffix.lower()
+        if suffix in {".json", ".csv"}:
+            return cls.from_omm_file(path)
+        if suffix in {".tle", ".txt"}:
+            return cls.from_tle_file(path)
+        raise ValueError("Orbit file must be .tle/.txt, .json, or .csv")
+
+    @property
+    def source_format(self) -> str:
+        formats = {record.source_format for record in self.records}
+        return formats.pop() if len(formats) == 1 else "mixed"
 
     def default_start_time_utc(self) -> datetime:
-        """Use the newest epoch in the catalog when no explicit start is supplied."""
         epochs = [sat.epoch.utc_datetime().astimezone(timezone.utc) for sat in self.satellites]
         return max(epochs)
 
@@ -90,11 +169,6 @@ class SGP4VisibilityEngine:
         time_slots: int,
         min_elevation_deg: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return visibility, elevation (deg), and slant range (km).
-
-        Arrays are indexed ``[radar, object, time_slot]``. Visibility is 1 when
-        the propagated object is at or above ``min_elevation_deg``.
-        """
         if start_time_utc.tzinfo is None:
             start_time_utc = start_time_utc.replace(tzinfo=timezone.utc)
         else:
