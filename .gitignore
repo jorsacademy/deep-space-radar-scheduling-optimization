@@ -1,11 +1,10 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .venv/
 venv/
-.pytest_cache/
-.coverage
-htmlcov/
-radar_schedule.png
-.DS_Store
-.idea/
-.vscode/
+*.png
+*.txt
+!requirements.txt
+!data/*.tle
+data/current/
