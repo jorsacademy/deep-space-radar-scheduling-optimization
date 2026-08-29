@@ -1,26 +1,21 @@
 # Deep Space Radar Scheduling Optimization
 
-An educational mixed-integer linear programming (MILP) model for scheduling radar observations of resident space objects (RSOs). The project supports two visibility modes:
+Educational mixed-integer optimization for scheduling radar observations of resident space objects (RSOs), with both synthetic visibility and TLE/SGP4 propagation.
 
-1. **Synthetic mode** for lightweight deterministic demonstrations.
-2. **TLE/SGP4 mode** for propagating real two-line element sets and computing topocentric visibility from each radar site.
+The project modernizes an older prototype by making fixed observation duration, separation, energy accounting and coverage logic mutually consistent. It also supports real orbital geometry from TLE data and a lightweight data pipeline for refreshing public CelesTrak GP and SATCAT data.
 
-The optimization formulation reserves full observation duration, enforces sliding-window separation across all radars, links coverage variables correctly to observation counts, and uses consistent physical time in the energy model.
+## Features
 
-## What the model does
+- MILP scheduling with fixed-duration observation starts.
+- Full-slot radar occupancy and sliding-window observation separation.
+- Synthetic visibility mode for deterministic experimentation.
+- TLE parsing and SGP4/topocentric visibility mode.
+- Current CelesTrak GP/TLE download utility.
+- SATCAT metadata ingestion including radar cross section (RCS) when published.
+- Uncertainty-aware robustness evaluation by perturbing visibility and observation quality.
+- Schedule visualization and structural tests.
 
-- Defines three radar sites: Maui, Millstone Hill, and Goldstone.
-- Accepts standard 2-line or 3-line TLE catalogs.
-- Propagates TLE objects with SGP4 through Skyfield.
-- Converts propagated states into site-relative elevation and slant range.
-- Marks an object visible when its elevation is above the configured minimum elevation.
-- Computes a simplified radar-quality score from propagated range, elevation, RCS assumptions, and an SNR-style radar equation.
-- Creates fixed-duration observation-start decisions.
-- Maximizes priority-weighted object coverage with a secondary quality reward.
-- Enforces radar capacity, observation duration, inter-observation separation, visibility, and daily energy constraints.
-- Produces summary metrics and a schedule plot.
-
-> This remains an educational/research prototype, not an operational space-domain-awareness system. SGP4 visibility is materially more realistic than the original synthetic pass generator, but radar hardware, atmospheric loss, pointing/slew dynamics, uncertainty, covariance, tasking doctrine, and RCS modeling are still simplified.
+> This is an educational/research prototype, not an operational space-domain-awareness system. Public catalog data can be stale or incomplete, radar performance is simplified, and many operational effects are not modeled.
 
 ## Installation
 
@@ -30,87 +25,70 @@ source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
-CBC is used through PuLP. Most PuLP installations include a compatible CBC binary; otherwise install CBC separately for your platform.
+CBC is used through PuLP. Most PuLP installations include a compatible CBC binary; otherwise install CBC separately.
 
-## Run: synthetic mode
+## Synthetic mode
 
 ```bash
 python radar_scheduler.py
 ```
 
-This preserves the original demonstration workflow and does not require orbital data.
+## TLE / SGP4 mode
 
-## Run: TLE + SGP4 mode
-
-Pass a TLE catalog with `--tle-file`:
+A historical Vanguard 1 TLE is included only as a reproducible propagation example:
 
 ```bash
-python radar_scheduler.py \
-  --tle-file data/vanguard1.tle \
-  --horizon-hours 24 \
-  --output radar_schedule_sgp4.png
+python radar_scheduler.py --tle-file data/vanguard1.tle
 ```
 
-If `--start-utc` is omitted, the scheduler uses the newest epoch in the supplied TLE catalog as the horizon start. This is useful for reproducible historical examples.
+For meaningful current analysis, refresh the catalog first.
 
-For an operational/current catalog, provide an explicit UTC start near the TLE epoch:
+## Refresh current public catalog data
+
+The refresh utility uses CelesTrak's public GP endpoint for orbital elements and SATCAT endpoint for catalog metadata.
+
+Example: current space-station group
 
 ```bash
-python radar_scheduler.py \
-  --tle-file data/current_catalog.tle \
-  --start-utc 2026-08-29T00:00:00Z
+python refresh_catalog.py --group stations --output-dir data/current/stations
 ```
 
-### TLE format
+Example: one NORAD catalog object
 
-Standard three-line format:
+```bash
+python refresh_catalog.py --catnr 25544 --output-dir data/current/iss
+```
+
+It writes:
 
 ```text
-OBJECT NAME
-1 NNNNNU ...
-2 NNNNN  ...
+data/current/.../
+├── catalog.tle
+└── satcat_metadata.json
 ```
 
-Standard two-line records without a name are also supported; the loader derives a fallback name from the NORAD catalog number.
+The metadata file includes fields such as object type, owner, apogee, perigee, inclination and `RCS` when CelesTrak publishes it. RCS is not available for every catalog object, so downstream radar-quality calculations must retain a documented fallback value or uncertainty model.
 
-The repository contains `data/vanguard1.tle`, a **real historical Vanguard 1 TLE used in standard SGP4 verification material**. It is intentionally old and exists only as a reproducible propagation example. Do not treat it as current orbital data. Replace it with a current catalog when analyzing present-day visibility.
+Important: classic TLE format cannot represent newly assigned catalog numbers above its traditional five-digit catalog-number limit. CelesTrak also provides OMM JSON/CSV/XML formats; migrating the propagator input to OMM is the next compatibility step for full future catalogs.
 
-## How SGP4 visibility works
+## Uncertainty-aware scheduling
 
-For every radar-object-time combination, `orbital_visibility.py`:
+`uncertainty.py` provides Monte Carlo-style robustness evaluation. It repeatedly re-solves a fresh scheduler after randomly removing a configurable fraction of visibility opportunities and perturbing observation quality.
 
-1. Parses the TLE into a Skyfield `EarthSatellite` object.
-2. Propagates the satellite at every scheduling time slot using SGP4.
-3. Builds a topocentric observer at the radar latitude, longitude, and elevation.
-4. Computes elevation angle and slant range.
-5. Sets visibility to 1 when elevation is at least the configured minimum elevation.
+```python
+from radar_scheduler import DeepSpaceRadarScheduler
+from uncertainty import evaluate_schedule_uncertainty
 
-The resulting arrays are indexed as:
-
-```text
-[radar, object, time_slot]
+summary = evaluate_schedule_uncertainty(
+    lambda: DeepSpaceRadarScheduler(seed=42),
+    simulations=50,
+    visibility_dropout_probability=0.10,
+    quality_relative_sigma=0.10,
+)
+print(summary)
 ```
 
-The scheduler then uses propagated slant range and elevation in its simplified radar-quality calculation.
-
-## Important modeling note: RCS
-
-TLEs do not contain radar cross section. In TLE mode the current implementation assigns a default `10 m²` RCS and priority `1.0` to imported objects. For serious analysis, replace these defaults with object-specific metadata from an appropriate catalog before interpreting SNR/quality values quantitatively.
-
-## Test
-
-```bash
-pytest -q
-```
-
-Tests cover:
-
-- slot/duration invariants,
-- full-duration visibility requirements,
-- utilization accounting,
-- TLE parsing,
-- SGP4 propagation output shapes and finite ranges,
-- scheduler initialization in TLE mode.
+This is a robustness diagnostic rather than a full stochastic-programming formulation. A stronger future extension would optimize first-stage scheduling decisions against scenarios directly rather than independently re-solving each perturbed instance.
 
 ## Model defaults
 
@@ -121,16 +99,24 @@ Tests cover:
 | Observation duration | 20 min |
 | Minimum observations per object | 3 |
 | Minimum separation between starts | 60 min |
-| Minimum elevation | 5° |
 | Synthetic objects | 25 |
 | Radar sites | 3 |
+
+## Tests
+
+```bash
+pytest -q
+```
 
 ## Project structure
 
 ```text
 .
-├── orbital_visibility.py
 ├── radar_scheduler.py
+├── orbital_visibility.py
+├── catalog_client.py
+├── refresh_catalog.py
+├── uncertainty.py
 ├── requirements.txt
 ├── data/
 │   └── vanguard1.tle
@@ -140,27 +126,17 @@ Tests cover:
 └── README.md
 ```
 
-## Key formulation corrections from the original prototype
+## Data-source notes
 
-The original prototype treated a scheduled observation as a one-slot binary decision while charging and plotting it as a multi-slot observation. That allowed temporal overlap. A start decision at slot `t` now occupies every slot in `[t, t + duration)`.
+CelesTrak GP queries can return TLE, OMM XML/KVN, JSON and CSV. SATCAT CSV/JSON records include an RCS field in square meters when available. The downloader deliberately identifies itself with a user agent and performs explicit, user-triggered refreshes rather than background scraping.
 
-Object separation is enforced using sliding windows rather than disjoint time blocks, preventing boundary violations. Coverage variable `z[o]` is linked in both directions: an object is marked covered if and only if it receives at least the minimum number of observations. Objects with no feasible observation starts are forced to `z[o] = 0`.
+## Current limitations
 
-## Remaining limitations
-
-SGP4 propagates TLE mean elements and is appropriate for TLE-based orbit prediction, but this repository does not yet model:
-
-- TLE age/error growth or covariance,
-- radar field-of-regard beyond minimum elevation,
-- antenna slew and settling time,
-- transmit/receive duty cycles,
-- atmospheric attenuation and ionospheric effects,
-- object-specific RCS/aspect dependence,
-- maintenance and weather outages,
-- simultaneous bistatic/multistatic observations,
-- track quality or orbit-determination covariance reduction.
-
-A logical next research step is to attach object metadata and uncertainty to the TLE catalog, then optimize not merely observation count but expected information gain/orbit-determination quality.
+- TLE mode still uses simplified radar SNR/quality physics.
+- SATCAT RCS can be missing and is not a measurement uncertainty distribution.
+- Slew/setup time, maintenance, calibration, weather correlation, track initiation, handoffs and competing missions are omitted.
+- Current robustness analysis perturbs visibility and quality independently and does not model correlated orbital covariance.
+- TLE age matters: current operations should use fresh elements and an explicit epoch/staleness policy.
 
 ## License
 
